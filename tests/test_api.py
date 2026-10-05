@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -80,6 +81,24 @@ class ApiTestCase(unittest.TestCase):
     def add_anchor(self, device_id, local_ms, utc_ms):
         return self.req("POST", f"/devices/{device_id}/anchors",
                         {"local_ms": local_ms, "utc_ms": utc_ms})
+
+    def make_cycle(self, device_id, cycle_id, name=None):
+        payload = {"cycle_id": cycle_id}
+        if name is not None:
+            payload["name"] = name
+        return self.req("POST", f"/devices/{device_id}/cycles", payload)
+
+    def add_anchor_cycle(self, device_id, cycle_id, local_ms, utc_ms):
+        return self.req("POST", f"/devices/{device_id}/anchors",
+                        {"cycle_id": cycle_id, "local_ms": local_ms, "utc_ms": utc_ms})
+
+    def submit_cycle(self, capture_id, device_id, cycle_id, start, end, note=None):
+        payload = {"capture_id": capture_id, "device_id": device_id,
+                   "cycle_id": cycle_id,
+                   "local_start_ms": start, "local_end_ms": end}
+        if note is not None:
+            payload["note"] = note
+        return self.req("POST", "/segments", payload)
 
     def submit(self, capture_id, device_id, start, end, note=None):
         payload = {"capture_id": capture_id, "device_id": device_id,
@@ -453,6 +472,312 @@ class ApiTestCase(unittest.TestCase):
                 self.assertEqual(seg["status"], "located")
                 expected = u0 + (seg["local_start_ms"] - l0) * (u1 - u0) // (l1 - l0)
                 self.assertEqual(seg["utc_start_ms"], expected)
+
+
+    # ------------------------------------------------------------ 时钟周期
+
+    def test_default_cycle_auto_registered_and_listed(self):
+        self.make_device("D1")
+        status, body = self.req("GET", "/devices/D1/cycles")
+        self.assertEqual(status, 200)
+        ids = [c["cycle_id"] for c in body["cycles"]]
+        self.assertEqual(ids, ["default"])
+        # 重复登记 default：幂等
+        status, body = self.make_cycle("D1", "default")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["idempotent_replay"])
+        # default 带不同 name -> 冲突
+        status, body = self.make_cycle("D1", "default", name="改名")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "cycle_conflict")
+
+    def test_cycle_register_idempotent_conflict_and_404(self):
+        self.make_device("D1")
+        status, body = self.make_cycle("D1", "boot-2", name="重启后第2轮")
+        self.assertEqual(status, 201)
+        status, body = self.make_cycle("D1", "boot-2", name="重启后第2轮")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["idempotent_replay"])
+        status, body = self.make_cycle("D1", "boot-2", name="别的")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "cycle_conflict")
+        # 设备不存在
+        status, body = self.req("POST", "/devices/NOPE/cycles", {"cycle_id": "x"})
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "device_not_found")
+        # 非法周期编号
+        status, body = self.make_cycle("D1", "bad id!")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+
+    def test_cycles_independent_anchor_validation_and_local_reuse(self):
+        self.make_device("D1")
+        self.make_cycle("D1", "boot-2")
+        # 两个周期复用相同 local_ms，各自独立
+        self.assertEqual(self.add_anchor("D1", 1000, 100000)[0], 201)
+        self.assertEqual(self.add_anchor("D1", 2000, 101000)[0], 201)
+        self.assertEqual(self.add_anchor_cycle("D1", "boot-2", 1000, 200000)[0], 201)
+        self.assertEqual(self.add_anchor_cycle("D1", "boot-2", 2000, 202000)[0], 201)
+        # 同周期内重复 local_ms 仍被拒绝，且不影响另一周期
+        status, body = self.add_anchor("D1", 1000, 999999)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "anchors_not_increasing")
+        status, body = self.add_anchor_cycle("D1", "boot-2", 1000, 999999)
+        self.assertEqual(status, 400)
+        # 同周期 UTC 不递增；另一周期不受牵连
+        status, body = self.add_anchor_cycle("D1", "boot-2", 1500, 500000)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "anchors_not_increasing")
+        # 分周期列出
+        _, body = self.req("GET", "/devices/D1/anchors?cycle_id=default")
+        self.assertEqual([a["local_ms"] for a in body["anchors"]], [1000, 2000])
+        _, body = self.req("GET", "/devices/D1/anchors?cycle_id=boot-2")
+        self.assertEqual([(a["local_ms"], a["utc_ms"]) for a in body["anchors"]],
+                         [(1000, 200000), (2000, 202000)])
+        # 不分周期：两周期锚点都在
+        _, body = self.req("GET", "/devices/D1/anchors")
+        self.assertEqual(len(body["anchors"]), 4)
+        self.assertEqual({a["cycle_id"] for a in body["anchors"]},
+                         {"default", "boot-2"})
+
+    def test_anchor_and_segment_reject_unknown_cycle_no_write(self):
+        self.make_device("D1")
+        status, body = self.add_anchor_cycle("D1", "ghost", 1000, 100000)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "cycle_not_found")
+        status, body = self.submit_cycle("SG", "D1", "ghost", 0, 10)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "cycle_not_found")
+        self.assertEqual(self.req("GET", "/segments")[1]["count"], 0)
+        self.assertEqual(self.req("GET", "/devices/D1/anchors")[1]["anchors"], [])
+        # 显式空串 cycle_id -> 校验错误，不静默落默认周期
+        status, body = self.req("POST", "/devices/D1/anchors",
+                                {"cycle_id": "", "local_ms": 1, "utc_ms": 2})
+        self.assertEqual(status, 400)
+
+    def test_segment_uses_only_own_cycle_anchors(self):
+        self.make_device("D1")
+        self.make_cycle("D1", "boot-2")
+        # 只有 default 周期有锚点（local 1000~2000 -> utc 100000~101000）
+        self.add_anchor("D1", 1000, 100000)
+        self.add_anchor("D1", 2000, 101000)
+        # boot-2 周期 local 归零后同样的 1500：该周期无锚点 -> 无法定位
+        _, body = self.submit_cycle("S-B2", "D1", "boot-2", 1500, 1600)
+        self.assertEqual(body["segment"]["status"], "unlocatable")
+        self.assertEqual(body["segment"]["cycle_id"], "boot-2")
+        self.assertIsNone(body["segment"]["utc_start_ms"])
+        # 补登 boot-2 锚点后实时变为可定位，且映射用 boot-2 自己的锚点
+        self.add_anchor_cycle("D1", "boot-2", 1000, 200000)
+        self.add_anchor_cycle("D1", "boot-2", 2000, 202000)
+        _, body = self.req("GET", "/segments/S-B2")
+        seg = body["segment"]
+        self.assertEqual(seg["status"], "located")
+        self.assertEqual(seg["utc_start_ms"], 201000)
+        self.assertEqual(seg["utc_end_ms"], 201200)
+        # default 周期同 local 的声段仍按 default 锚点投影
+        _, body = self.submit("S-DEF", "D1", 1500, 1600)
+        self.assertEqual(body["segment"]["utc_start_ms"], 100500)
+
+    def test_segment_cycle_in_idempotency_and_conflict(self):
+        self.make_device("D1")
+        self.make_cycle("D1", "boot-2")
+        self.add_anchor("D1", 1000, 100000)
+        self.add_anchor("D1", 2000, 101000)
+        self.add_anchor_cycle("D1", "boot-2", 1000, 200000)
+        self.add_anchor_cycle("D1", "boot-2", 2000, 202000)
+        # 首次录入 default
+        status, _ = self.submit("CAP-1", "D1", 1100, 1200)
+        self.assertEqual(status, 201)
+        # 同内容（含周期）重传 -> 幂等
+        status, body = self.submit("CAP-1", "D1", 1100, 1200)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["idempotent_replay"])
+        # 仅周期不同的重传 -> 采集编号全局唯一，异内容冲突
+        status, body = self.submit_cycle("CAP-1", "D1", "boot-2", 1100, 1200)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "capture_conflict")
+        self.assertEqual(body["error"]["details"]["existing"]["cycle_id"], "default")
+        self.assertEqual(body["error"]["details"]["received"]["cycle_id"], "boot-2")
+        # 仍只有一条
+        self.assertEqual(self.req("GET", "/segments")[1]["count"], 1)
+
+    def test_cycle_scoped_correction(self):
+        self.make_device("D1")
+        self.make_cycle("D1", "boot-2")
+        self.add_anchor("D1", 1000, 100000)
+        self.add_anchor("D1", 2000, 101000)
+        self.add_anchor_cycle("D1", "boot-2", 1000, 200000)
+        self.add_anchor_cycle("D1", "boot-2", 2000, 202000)
+        self.submit("S-DEF", "D1", 1500, 1600)
+        self.submit_cycle("S-B2", "D1", "boot-2", 1500, 1600)
+        # PUT 不带 cycle_id 只替换 default
+        status, body = self.req("PUT", "/devices/D1/anchors", {"anchors": [
+            {"local_ms": 1000, "utc_ms": 100500},
+            {"local_ms": 2000, "utc_ms": 101500},
+        ]})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["cycle_id"], "default")
+        self.assertEqual(body["affected_segments"], 1)
+        _, body = self.req("GET", "/segments/S-DEF")
+        self.assertEqual(body["segment"]["utc_start_ms"], 101000)
+        _, body = self.req("GET", "/segments/S-B2")
+        self.assertEqual(body["segment"]["utc_start_ms"], 201000)  # 不受影响
+        # DELETE 带 cycle_id 只删该周期锚点
+        status, body = self.req("DELETE", "/devices/D1/anchors/2000?cycle_id=boot-2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["cycle_id"], "boot-2")
+        _, body = self.req("GET", "/segments/S-B2")
+        self.assertEqual(body["segment"]["status"], "unlocatable")
+        _, body = self.req("GET", "/segments/S-DEF")
+        self.assertEqual(body["segment"]["status"], "located")  # 不受影响
+
+    def test_publish_freezes_per_cycle_and_shows_ownership(self):
+        self.make_device("D1")
+        self.make_cycle("D1", "boot-2")
+        self.add_anchor("D1", 1000, 100000)
+        self.add_anchor("D1", 2000, 101000)
+        self.add_anchor_cycle("D1", "boot-2", 1000, 200000)
+        self.add_anchor_cycle("D1", "boot-2", 2000, 202000)
+        self.submit("S-DEF", "D1", 1500, 1600)
+        self.submit_cycle("S-B2", "D1", "boot-2", 1500, 1600)
+        status, v1 = self.req("POST", "/versions", {"note": "双周期首版"})
+        self.assertEqual(status, 201)
+        # 周期归属冻结
+        self.assertEqual({(c["device_id"], c["cycle_id"]) for c in v1["cycles"]},
+                         {("D1", "default"), ("D1", "boot-2")})
+        self.assertEqual({(a["cycle_id"], a["local_ms"]) for a in v1["anchors"]},
+                         {("default", 1000), ("default", 2000),
+                          ("boot-2", 1000), ("boot-2", 2000)})
+        by_id = {s["capture_id"]: s for s in v1["segments"]}
+        self.assertEqual(by_id["S-DEF"]["cycle_id"], "default")
+        self.assertEqual(by_id["S-DEF"]["utc_start_ms"], 100500)
+        self.assertEqual(by_id["S-B2"]["cycle_id"], "boot-2")
+        self.assertEqual(by_id["S-B2"]["utc_start_ms"], 201000)
+        # changes 条目带周期
+        self.assertEqual({a["capture_id"]: a["cycle_id"] for a in v1["changes"]["added"]},
+                         {"S-DEF": "default", "S-B2": "boot-2"})
+
+        # 更正 boot-2 后发 v2：只有 S-B2 位移
+        self.req("PUT", "/devices/D1/anchors",
+                 {"cycle_id": "boot-2", "anchors": [
+                     {"local_ms": 1000, "utc_ms": 200100},
+                     {"local_ms": 2000, "utc_ms": 202100},
+                 ]})
+        _, v2 = self.req("POST", "/versions")
+        self.assertEqual([d["capture_id"] for d in v2["changes"]["displaced"]], ["S-B2"])
+        disp = v2["changes"]["displaced"][0]
+        self.assertEqual(disp["cycle_id"], "boot-2")
+        self.assertEqual(disp["start_shift_ms"], 100)
+        # v1 回看不变（含周期字段）
+        _, v1_again = self.req("GET", "/versions/1")
+        self.assertEqual(v1_again["segments"], v1["segments"])
+        self.assertEqual(v1_again["anchors"], v1["anchors"])
+        self.assertEqual(v1_again["cycles"], v1["cycles"])
+
+    def test_current_timeline_and_segments_filter_by_cycle(self):
+        self.make_device("D1")
+        self.make_cycle("D1", "boot-2")
+        self.add_anchor("D1", 1000, 100000)
+        self.add_anchor("D1", 2000, 101000)
+        self.add_anchor_cycle("D1", "boot-2", 1000, 200000)
+        self.add_anchor_cycle("D1", "boot-2", 2000, 202000)
+        self.submit("S-DEF", "D1", 1500, 1600)
+        self.submit_cycle("S-B2", "D1", "boot-2", 1500, 1600)
+        # 当前时间轴带周期树
+        _, body = self.req("GET", "/timeline/current")
+        dev = next(d for d in body["devices"] if d["device_id"] == "D1")
+        self.assertEqual({c["cycle_id"] for c in dev["cycles"]},
+                         {"default", "boot-2"})
+        b2 = next(c for c in dev["cycles"] if c["cycle_id"] == "boot-2")
+        self.assertEqual(len(b2["anchors"]), 2)
+        # 声段过滤
+        _, body = self.req("GET", "/segments?device_id=D1&cycle_id=boot-2")
+        self.assertEqual([s["capture_id"] for s in body["segments"]], ["S-B2"])
+        # 过滤不存在周期 -> 404
+        status, body = self.req("GET", "/segments?device_id=D1&cycle_id=nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "cycle_not_found")
+        # 只有 cycle_id 无 device_id -> 400
+        status, body = self.req("GET", "/segments?cycle_id=boot-2")
+        self.assertEqual(status, 400)
+
+
+class LegacyMigrationTestCase(unittest.TestCase):
+    """周期功能上线前的旧库：升级后老数据视为 default 周期，已发布版本结果不变。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmpdir.name, "legacy.db")
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript("""
+        CREATE TABLE devices (device_id TEXT PRIMARY KEY, name TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE anchors (device_id TEXT NOT NULL, local_ms INTEGER NOT NULL,
+            utc_ms INTEGER NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (device_id, local_ms));
+        CREATE TABLE segments (capture_id TEXT PRIMARY KEY, device_id TEXT NOT NULL,
+            local_start_ms INTEGER NOT NULL, local_end_ms INTEGER NOT NULL, note TEXT,
+            content_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE versions (version_no INTEGER PRIMARY KEY, note TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE version_anchors (version_no INTEGER NOT NULL, device_id TEXT NOT NULL,
+            local_ms INTEGER NOT NULL, utc_ms INTEGER NOT NULL,
+            PRIMARY KEY (version_no, device_id, local_ms));
+        CREATE TABLE version_segments (version_no INTEGER NOT NULL, capture_id TEXT NOT NULL,
+            device_id TEXT NOT NULL, local_start_ms INTEGER NOT NULL, local_end_ms INTEGER NOT NULL,
+            note TEXT, status TEXT NOT NULL, utc_start_ms INTEGER, utc_end_ms INTEGER,
+            created_at TEXT, PRIMARY KEY (version_no, capture_id));
+        INSERT INTO devices VALUES ('D1','甲','t0');
+        INSERT INTO anchors VALUES ('D1',1000,100000,'t0'),('D1',2000,101000,'t0');
+        INSERT INTO segments VALUES ('OLD','D1',1100,1200,NULL,'h','t0');
+        INSERT INTO versions VALUES (1,'旧版','t0');
+        INSERT INTO version_anchors VALUES (1,'D1',1000,100000),(1,'D1',2000,101000);
+        INSERT INTO version_segments VALUES
+            (1,'OLD','D1',1100,1200,NULL,'located',100100,100200,'t0');
+        """)
+        conn.commit()
+        conn.close()
+
+        db.init_db(self.db_path)  # 触发迁移
+        self.server = server.make_server("127.0.0.1", 0, self.db_path)
+        self.port = self.server.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmpdir.cleanup()
+
+    def req(self, method, path, body=None):
+        return request(self.base, method, path, body)
+
+    def test_legacy_data_defaults_to_default_cycle(self):
+        status, body = self.req("GET", "/devices/D1/cycles")
+        self.assertEqual(status, 200)
+        self.assertEqual([c["cycle_id"] for c in body["cycles"]], ["default"])
+        # 旧声段归入 default，投影不变
+        _, body = self.req("GET", "/segments/OLD")
+        self.assertEqual(body["segment"]["cycle_id"], "default")
+        self.assertEqual(body["segment"]["status"], "located")
+        self.assertEqual(body["segment"]["utc_start_ms"], 100100)
+        # 已发布旧版本查询结果不变（仅多出 cycle_id=default 归属）
+        _, v1 = self.req("GET", "/versions/1")
+        seg = v1["segments"][0]
+        self.assertEqual(seg["capture_id"], "OLD")
+        self.assertEqual(seg["cycle_id"], "default")
+        self.assertEqual(seg["utc_start_ms"], 100100)
+        self.assertEqual({(a["cycle_id"], a["local_ms"]) for a in v1["anchors"]},
+                         {("default", 1000), ("default", 2000)})
+        # 迁移后可正常使用新周期
+        status, _ = self.req("POST", "/devices/D1/cycles", {"cycle_id": "boot-2"})
+        self.assertEqual(status, 201)
+        status, _ = self.req("POST", "/devices/D1/anchors",
+                             {"cycle_id": "boot-2", "local_ms": 1000, "utc_ms": 200000})
+        self.assertEqual(status, 201)
+        # 新周期复用旧 local_ms 不冲突
+        status, _ = self.req("POST", "/devices/D1/anchors",
+                             {"cycle_id": "boot-2", "local_ms": 2000, "utc_ms": 201000})
+        self.assertEqual(status, 201)
 
 
 if __name__ == "__main__":

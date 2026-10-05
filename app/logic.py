@@ -77,6 +77,21 @@ def validate_id(value, field: str) -> str:
     return value
 
 
+def validate_cycle_id(value, field: str = "cycle_id", default: str | None = None) -> str:
+    """周期编号：缺省（字段省略或 null）归入默认周期；给出时必须是合法 ID。
+
+    显式传入空串或非法类型同样拒绝（不会静默落到默认周期）。
+    """
+    if value is None:
+        if default is not None:
+            return default
+    if not isinstance(value, str) or not ID_RE.match(value):
+        raise ApiError(400, "validation_error",
+                       f"{field} 必须以字母或数字开头，仅含字母、数字、_ . - ，长度 1-128",
+                       {"field": field, "value": value})
+    return value
+
+
 def validate_note(value) -> str | None:
     if value is None:
         return None
@@ -142,12 +157,16 @@ def sort_projections(projs: list[dict]) -> list[dict]:
     return sorted(projs, key=key)
 
 
-def segment_content_hash(capture_id: str, device_id: str,
+def segment_content_hash(capture_id: str, device_id: str, cycle_id: str,
                          local_start_ms: int, local_end_ms: int,
                          note: str | None) -> str:
-    """声段内容指纹：用于"同编号同内容幂等、异内容冲突"的判定。"""
+    """声段内容指纹：用于"同编号同内容幂等、异内容冲突"的判定。
+
+    周期计入内容：同一采集编号若以不同周期（或不同设备/起止/note）重传，
+    一律视为异内容冲突。采集编号本身仍全库唯一。
+    """
     canonical = json.dumps(
-        {"capture_id": capture_id, "device_id": device_id,
+        {"capture_id": capture_id, "device_id": device_id, "cycle_id": cycle_id,
          "local_start_ms": local_start_ms, "local_end_ms": local_end_ms,
          "note": note},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -179,6 +198,7 @@ def compute_changes(prev_list: list[dict], curr_list: list[dict]) -> dict:
             displaced.append({
                 "capture_id": c,
                 "device_id": n["device_id"],
+                "cycle_id": n["cycle_id"],
                 "previous": {"status": p["status"],
                              "utc_start_ms": p["utc_start_ms"],
                              "utc_end_ms": p["utc_end_ms"]},
@@ -188,5 +208,5 @@ def compute_changes(prev_list: list[dict], curr_list: list[dict]) -> dict:
                 "start_shift_ms": (n["utc_start_ms"] - p["utc_start_ms"]) if both else None,
                 "end_shift_ms": (n["utc_end_ms"] - p["utc_end_ms"]) if both else None,
             })
-    displaced.sort(key=lambda d: (d["device_id"], d["capture_id"]))
+    displaced.sort(key=lambda d: (d["device_id"], d["cycle_id"], d["capture_id"]))
     return {"added": added, "removed": removed, "displaced": displaced}

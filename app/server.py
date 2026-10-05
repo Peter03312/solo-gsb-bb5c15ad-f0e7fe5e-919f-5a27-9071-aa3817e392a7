@@ -8,7 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__, service
-from .logic import ApiError
+from .db import DEFAULT_CYCLE_ID
+from .logic import ApiError, validate_cycle_id
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
 
@@ -28,6 +29,14 @@ def _parse_int_param(value: str, name: str) -> int:
                        f"路径参数 {name} 必须是整数", {"value": value})
 
 
+def _cycle_query(query) -> str | None:
+    """解析 ?cycle_id= 查询参数；未给出返回 None，给出则校验合法性。"""
+    raw = query.get("cycle_id", [None])[0]
+    if raw is None:
+        return None
+    return validate_cycle_id(raw)
+
+
 # ---------------------------------------------------------------- 路由处理
 
 def h_root(ctx, body, query):
@@ -40,12 +49,14 @@ def h_root(ctx, body, query):
             "POST   /devices",
             "GET    /devices",
             "GET    /devices/{device_id}",
-            "POST   /devices/{device_id}/anchors",
-            "GET    /devices/{device_id}/anchors",
-            "PUT    /devices/{device_id}/anchors            # 锚点更正（整体替换）",
-            "DELETE /devices/{device_id}/anchors/{local_ms} # 锚点更正（删除单个）",
-            "POST   /segments",
-            "GET    /segments",
+            "POST   /devices/{device_id}/cycles                  # 登记时钟周期 {cycle_id, name?}",
+            "GET    /devices/{device_id}/cycles                  # 周期列表",
+            "POST   /devices/{device_id}/anchors                 # body 可带 cycle_id（省略=default）",
+            "GET    /devices/{device_id}/anchors                 # 可加 ?cycle_id=",
+            "PUT    /devices/{device_id}/anchors            # 锚点更正（整体替换某周期，body 可带 cycle_id）",
+            "DELETE /devices/{device_id}/anchors/{local_ms} # 锚点更正（删除单个；可加 ?cycle_id=）",
+            "POST   /segments                                    # body 可带 cycle_id（省略=default）",
+            "GET    /segments                                    # 可加 ?device_id=&cycle_id=",
             "GET    /segments/{capture_id}",
             "DELETE /segments/{capture_id}",
             "GET    /timeline/current",
@@ -72,12 +83,20 @@ def h_get_device(ctx, body, query, device_id):
     return service.get_device(ctx.db_path, device_id)
 
 
+def h_create_cycle(ctx, body, query, device_id):
+    return service.create_cycle(ctx.db_path, device_id, body)
+
+
+def h_list_cycles(ctx, body, query, device_id):
+    return service.list_cycles(ctx.db_path, device_id)
+
+
 def h_add_anchor(ctx, body, query, device_id):
     return service.add_anchor(ctx.db_path, device_id, body)
 
 
 def h_list_anchors(ctx, body, query, device_id):
-    return service.list_anchors(ctx.db_path, device_id)
+    return service.list_anchors(ctx.db_path, device_id, _cycle_query(query))
 
 
 def h_replace_anchors(ctx, body, query, device_id):
@@ -88,7 +107,8 @@ def h_delete_anchor(ctx, body, query, device_id, local_ms):
     ms = _parse_int_param(local_ms, "local_ms")
     if ms < 0:
         raise ApiError(400, "invalid_time", "local_ms 不能为负", {"local_ms": ms})
-    return service.delete_anchor(ctx.db_path, device_id, ms)
+    return service.delete_anchor(ctx.db_path, device_id, ms,
+                                 _cycle_query(query) or DEFAULT_CYCLE_ID)
 
 
 def h_submit_segment(ctx, body, query):
@@ -97,7 +117,8 @@ def h_submit_segment(ctx, body, query):
 
 def h_list_segments(ctx, body, query):
     device_id = query.get("device_id", [None])[0]
-    return service.list_segments(ctx.db_path, device_id)
+    cycle_id = _cycle_query(query)
+    return service.list_segments(ctx.db_path, device_id, cycle_id)
 
 
 def h_get_segment(ctx, body, query, capture_id):
@@ -133,6 +154,8 @@ ROUTES = [
     ("POST", r"^/devices$", h_create_device),
     ("GET", r"^/devices$", h_list_devices),
     ("GET", r"^/devices/(?P<device_id>[^/]+)$", h_get_device),
+    ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles$", h_create_cycle),
+    ("GET", r"^/devices/(?P<device_id>[^/]+)/cycles$", h_list_cycles),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_add_anchor),
     ("GET", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_list_anchors),
     ("PUT", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_replace_anchors),

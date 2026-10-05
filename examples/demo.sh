@@ -68,3 +68,44 @@ curl -s "$BASE/versions/1" | pp
 
 echo; echo "== 版本列表 =="
 curl -s "$BASE/versions" | pp
+
+# ---------------------------------------------------------------- 时钟周期
+echo; echo "== 设备重启 -> 本地毫秒归零：登记新时钟周期 boot-2 =="
+curl -s -X POST "$BASE/devices/D1/cycles" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","name":"重启后第2轮"}' | pp
+echo "-- 周期列表（设备注册时自带 default 周期）--"
+curl -s "$BASE/devices/D1/cycles" | pp
+
+echo; echo "== boot-2 周期录入锚点：local_ms 从 1000 重新开始，不与 default 冲突 =="
+curl -s -X POST "$BASE/devices/D1/anchors" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","local_ms":1000,"utc_ms":1700000100000}' | pp
+curl -s -X POST "$BASE/devices/D1/anchors" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","local_ms":61000,"utc_ms":1700000160500}' | pp
+
+echo; echo "== boot-2 声段：同样的本地毫秒，只按所属周期锚点投影 =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0010","device_id":"D1","cycle_id":"boot-2","local_start_ms":5000,"local_end_ms":20000,"note":"重启后鸟鸣"}' | pp
+
+echo; echo "== 未登记周期 -> 404 cycle_not_found，拒绝且不写入 =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0011","device_id":"D1","cycle_id":"ghost","local_start_ms":1,"local_end_ms":2}' | pp
+
+echo; echo "== 采集编号全局唯一：CAP-0010 仅换周期重传 -> 409 冲突 =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0010","device_id":"D1","cycle_id":"default","local_start_ms":5000,"local_end_ms":20000}' | pp
+
+echo; echo "== 按周期过滤声段 / 锚点 =="
+curl -s "$BASE/segments?device_id=D1&cycle_id=boot-2" | pp
+curl -s "$BASE/devices/D1/anchors?cycle_id=boot-2" | pp
+
+echo; echo "== boot-2 锚点更正只影响该周期（整体替换时带 cycle_id）=="
+curl -s -X PUT "$BASE/devices/D1/anchors" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","anchors":[{"local_ms":1000,"utc_ms":1700000100250},{"local_ms":61000,"utc_ms":1700000160750}]}' | pp
+echo "-- 删除锚点时带 cycle_id：DELETE /devices/D1/anchors/61000?cycle_id=boot-2 --"
+
+echo; echo "== 当前时间轴：devices[].cycles[] 展示周期归属，segments 带 cycle_id =="
+curl -s "$BASE/timeline/current" | pp
+
+echo; echo "== 发布 v3：原子冻结各周期锚点与声段投影 =="
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"note":"纳入重启后周期"}' | pp
