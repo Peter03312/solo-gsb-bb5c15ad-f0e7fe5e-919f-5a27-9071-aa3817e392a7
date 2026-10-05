@@ -23,6 +23,9 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 STATUS_LOCATED = "located"
 STATUS_UNLOCATABLE = "unlocatable"
 
+# 默认周期：未显式指定 cycle_id 的锚点/声段一律归入此周期。
+DEFAULT_CYCLE_ID = "default"
+
 
 class ApiError(Exception):
     """业务错误，直接映射为 HTTP 错误响应。"""
@@ -75,6 +78,13 @@ def validate_id(value, field: str) -> str:
                        f"{field} 必须以字母或数字开头，仅含字母、数字、_ . - ，长度 1-128",
                        {"field": field, "value": value})
     return value
+
+
+def validate_cycle_id(value) -> str:
+    """周期编号：省略/缺省 -> 默认周期；否则按与设备/采集编号相同的命名规则校验。"""
+    if value is None:
+        return DEFAULT_CYCLE_ID
+    return validate_id(value, "cycle_id")
 
 
 def validate_note(value) -> str | None:
@@ -142,12 +152,15 @@ def sort_projections(projs: list[dict]) -> list[dict]:
     return sorted(projs, key=key)
 
 
-def segment_content_hash(capture_id: str, device_id: str,
+def segment_content_hash(capture_id: str, device_id: str, cycle_id: str,
                          local_start_ms: int, local_end_ms: int,
                          note: str | None) -> str:
-    """声段内容指纹：用于"同编号同内容幂等、异内容冲突"的判定。"""
+    """声段内容指纹：用于"同编号同内容幂等、异内容冲突"的判定。
+
+    周期计入内容：同采集编号仅当（设备、周期、本地起止、note）全一致才算同内容。
+    """
     canonical = json.dumps(
-        {"capture_id": capture_id, "device_id": device_id,
+        {"capture_id": capture_id, "device_id": device_id, "cycle_id": cycle_id,
          "local_start_ms": local_start_ms, "local_end_ms": local_end_ms,
          "note": note},
         sort_keys=True, separators=(",", ":"), ensure_ascii=False)

@@ -68,3 +68,52 @@ curl -s "$BASE/versions/1" | pp
 
 echo; echo "== 版本列表 =="
 curl -s "$BASE/versions" | pp
+
+# ----------------------------------------------------------------------
+# 时钟周期（cycle）：设备重启后本地毫秒归零，可登记新周期复用 local_ms
+# ----------------------------------------------------------------------
+
+echo; echo "== 登记新周期（设备 D2 重启后的新一轮，本地毫秒重新从 0 起算）=="
+curl -s -X POST "$BASE/devices/D2/cycles" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","note":"第二次开机"}' | pp
+echo "-- 周期列表（注册设备时自动带 default 周期）--"
+curl -s "$BASE/devices/D2/cycles" | pp
+
+echo; echo "== 新周期录入锚点：local_ms 与 default 周期可重复 =="
+curl -s -X POST "$BASE/devices/D2/anchors" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","local_ms":0,"utc_ms":1700010000000}' | pp
+curl -s -X POST "$BASE/devices/D2/anchors" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","local_ms":60000,"utc_ms":1700010060000}' | pp
+
+echo; echo "== 同设备同 local_ms 在两个周期各有一个锚点 =="
+curl -s "$BASE/devices/D2/anchors" | pp
+echo "-- 只看某一周期：?cycle_id=boot-2 --"
+curl -s "$BASE/devices/D2/anchors?cycle_id=boot-2" | pp
+
+echo; echo "== 声段指定周期：相同 local 起止，只用所属周期锚点映射 =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0101","device_id":"D2","cycle_id":"boot-2","local_start_ms":3000,"local_end_ms":9000,"note":"重启后录制"}' | pp
+
+echo; echo "== 同一采集编号换周期重传 -> 409（周期计入内容）=="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-0002","device_id":"D2","cycle_id":"boot-2","local_start_ms":3000,"local_end_ms":9000}' | pp
+
+echo; echo "== 周期不存在 -> 404 cycle_not_found，且不写入 =="
+curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
+  -d '{"capture_id":"CAP-9999","device_id":"D2","cycle_id":"not-registered","local_start_ms":1,"local_end_ms":2}' | pp
+
+echo; echo "== 当前时间轴（cycles/anchors/segments 均带周期归属）=="
+curl -s "$BASE/timeline/current" | pp
+
+echo; echo "== 发布 v3：原子冻结各周期锚点与声段投影（format_rev=2）=="
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' -d '{"note":"加入重启周期"}' | pp
+
+echo; echo "== 只更正 boot-2 周期锚点（default 等其他周期不动）=="
+curl -s -X PUT "$BASE/devices/D2/anchors" -H 'Content-Type: application/json' \
+  -d '{"cycle_id":"boot-2","anchors":[{"local_ms":0,"utc_ms":1700010000300},{"local_ms":60000,"utc_ms":1700010060300}]}' | pp
+
+echo; echo "== 发布 v4：changes 仅列出 boot-2 周期声段位移 =="
+curl -s -X POST "$BASE/versions" | pp
+
+echo; echo "== 回看 v3：各周期冻结不变 =="
+curl -s "$BASE/versions/3" | pp

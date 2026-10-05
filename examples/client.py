@@ -36,23 +36,41 @@ class TimelineClient:
             payload["name"] = name
         return self._call("POST", "/devices", payload)
 
-    # 锚点
-    def add_anchor(self, device_id: str, local_ms: int, utc_ms: int):
-        return self._call("POST", f"/devices/{device_id}/anchors",
-                          {"local_ms": local_ms, "utc_ms": utc_ms})
+    # 时钟周期（设备重启轮次）
+    def register_cycle(self, device_id: str, cycle_id: str, note: str | None = None):
+        payload = {"cycle_id": cycle_id}
+        if note is not None:
+            payload["note"] = note
+        return self._call("POST", f"/devices/{device_id}/cycles", payload)
 
-    def replace_anchors(self, device_id: str, anchors: list[dict]):
-        return self._call("PUT", f"/devices/{device_id}/anchors",
-                          {"anchors": anchors})
+    def list_cycles(self, device_id: str):
+        return self._call("GET", f"/devices/{device_id}/cycles")
+
+    # 锚点
+    def add_anchor(self, device_id: str, local_ms: int, utc_ms: int,
+                   cycle_id: str | None = None):
+        payload = {"local_ms": local_ms, "utc_ms": utc_ms}
+        if cycle_id is not None:
+            payload["cycle_id"] = cycle_id
+        return self._call("POST", f"/devices/{device_id}/anchors", payload)
+
+    def replace_anchors(self, device_id: str, anchors: list[dict],
+                        cycle_id: str | None = None):
+        payload = {"anchors": anchors}
+        if cycle_id is not None:
+            payload["cycle_id"] = cycle_id
+        return self._call("PUT", f"/devices/{device_id}/anchors", payload)
 
     # 声段
     def submit_segment(self, capture_id: str, device_id: str,
                        local_start_ms: int, local_end_ms: int,
-                       note: str | None = None):
+                       note: str | None = None, cycle_id: str | None = None):
         payload = {"capture_id": capture_id, "device_id": device_id,
                    "local_start_ms": local_start_ms, "local_end_ms": local_end_ms}
         if note is not None:
             payload["note"] = note
+        if cycle_id is not None:
+            payload["cycle_id"] = cycle_id
         return self._call("POST", "/segments", payload)
 
     # 时间轴与版本
@@ -113,6 +131,26 @@ def main() -> None:
 
     # 8. 回看 v1：已发布版本保持不变
     show("回看 v1（不变）", *cli.version(1))
+
+    # 9. 设备重启：本地毫秒归零，登记新周期 boot-2 并复用 local_ms
+    show("登记周期 boot-2", *cli.register_cycle("D1", "boot-2", note="第二次开机"))
+    show("周期列表", *cli.list_cycles("D1"))
+    #    boot-2 周期在 local_ms=1000 处重新对时（UTC 与 default 完全不同）
+    show("boot-2 锚点#1（复用 local_ms=1000）",
+         *cli.add_anchor("D1", 1000, 1700010000000, cycle_id="boot-2"))
+    show("boot-2 锚点#2",
+         *cli.add_anchor("D1", 61000, 1700010060500, cycle_id="boot-2"))
+    #    相同 local 起止的声段，只按 boot-2 周期锚点映射
+    show("提交 boot-2 声段 CAP-0100",
+         *cli.submit_segment("CAP-0100", "D1", 5000, 20000,
+                             note="重启后录制", cycle_id="boot-2"))
+    #    同采集编号换周期 -> 409（周期计入内容指纹）
+    show("CAP-0001 换周期重传(409)",
+         *cli.submit_segment("CAP-0001", "D1", 5000, 20000,
+                             note="鸟鸣", cycle_id="boot-2"))
+
+    # 10. 发布 v3：各周期锚点与声段投影原子冻结，文档带 cycle_id / format_rev=2
+    show("发布 v3（双周期冻结）", *cli.publish("加入重启周期"))
 
 
 if __name__ == "__main__":
